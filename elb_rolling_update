@@ -1,0 +1,69 @@
+#Purpose: To execute commands on instances under a specific load balancer by removing it from elb and attaching to elb after the execution completes. Even after the successfull completion of command, if the instance is not becoming healthy under a maximum attempt of 50 tries with 6 seconds delay.
+
+#!/usr/bin/python
+import boto3
+import sys
+import argparse
+import time
+import paramiko
+from botocore.exceptions import ClientError, WaiterError
+elb = boto3.client('elb')
+ec2 = boto3.resource('ec2')
+ssh = paramiko.SSHClient()
+ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+list_instance_id = []
+parse = argparse.ArgumentParser(description='Script to de-register and execute tasks on instances under a load balancer  and re-register after the completion of tasks')
+parse.add_argument('--elb', required='True', action='store', dest='elb_name')
+parse.add_argument('--cmd', required='True', action='append', dest='commands', help ="Enclose the commands in double quotes")
+parse.add_argument('--key', required='True', action='store', dest ='pem_file')
+parse.add_argument('--drainout', default='120', type=int, dest='dout', help="optional argument to pass the drain out time in seconds")
+args = parse.parse_args()
+k = paramiko.RSAKey.from_private_key_file(args.pem_file)
+
+
+def deregister_instance():
+		ip_addr = ec2.Instance(id).private_ip_address
+		print("De registering instance.. " + ip_addr)
+		deregister = elb.deregister_instances_from_load_balancer(LoadBalancerName=args.elb_name,Instances = [{'InstanceId':id}])
+		list_instance_id.remove(id)
+		time.sleep(args.dout)
+		print("De registration completed for " + ip_addr)
+		ssh.connect(ip_addr, username='ubuntu', pkey = k)
+		print("Connected to " + ip_addr)
+		for cmd in args.commands:
+			stdin, stdout, stderr = ssh.exec_command(cmd)
+			exit_status = str(stdout.channel.recv_exit_status())
+			if exit_status != "0":
+				print("\033[31m command " +cmd+ " FALIED..instance will be re attached to elb now....")
+				re_register_instance()
+				print("Instance is now attached to the elb.. exiting the script")
+				quit()		
+			for line in stdout:
+				print(line)
+			
+def re_register_instance():
+		try:
+		    print("Re-registering " + ec2.Instance(id).private_ip_address)
+		    time.sleep(10)
+		    register = elb.register_instances_with_load_balancer(LoadBalancerName=args.elb_name, Instances =[{'InstanceId':id}])
+		    print("Re-registered " + ec2.Instance(id).private_ip_address)
+		    waiter = elb.get_waiter('instance_in_service')
+		    waiter.wait(LoadBalancerName=args.elb_name,Instances=[{'InstanceId':id}],WaiterConfig={'Delay':6,'MaxAttempts':50})
+		    print("The instance is healthy now")
+		except WaiterError:
+			print('\033[31m The instance is not healthy. Cant proceed further')
+			quit()
+	    
+	    
+
+load_balancers = elb.describe_load_balancers(LoadBalancerNames=[args.elb_name])
+desc = load_balancers['LoadBalancerDescriptions']
+for i in range(0,len(desc)):
+	instances = load_balancers['LoadBalancerDescriptions'][i]['Instances']
+	for j in range(0,len(instances)):
+			id = load_balancers['LoadBalancerDescriptions'][i]['Instances'][j]['InstanceId']
+			list_instance_id.append(id)
+			deregister_instance()
+			re_register_instance()
+			print('\033[32m SUCESSFULLY RE-REGISTERED')
+
